@@ -1,0 +1,128 @@
+name: Auto-sync and package Facebook Plus IPA
+
+on:
+  schedule:
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: facebook-plus-auto-ipa-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      release_tag: ${{ steps.state.outputs.release_tag }}
+      upstream_sha: ${{ steps.state.outputs.upstream_sha }}
+      build_needed: ${{ steps.state.outputs.build_needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Sync upstream via non-force merge and check release
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IPA_SOURCE_URL: ${{ secrets.FACEBOOK_IPA_URL }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/SHAJON-404/Facebook-Plus.git
+          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
+          upstream_sha="$(git rev-parse refs/remotes/upstream/main)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                merge --no-ff --no-edit refs/remotes/upstream/main
+            git push origin HEAD:main
+          fi
+          tag="fb-auto-${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ -z "${IPA_SOURCE_URL:-}" ]]; then
+            echo 'build_needed=false' >> "$GITHUB_OUTPUT"
+            echo 'Waiting for secret FACEBOOK_IPA_URL: direct HTTPS link to your own decrypted Facebook IPA.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "$IPA_SOURCE_URL" == https://* ]] || { echo 'FACEBOOK_IPA_URL must use HTTPS.' >&2; exit 1; }
+          count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(endswith(".ipa"))] | length' 2>/dev/null || printf '0')"
+          if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'build_needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build_needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    needs: prepare
+    if: needs.prepare.outputs.build_needed == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout synchronized fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          submodules: recursive
+      - name: Download user-provided decrypted Facebook IPA
+        shell: bash
+        env:
+          IPA_SOURCE_URL: ${{ secrets.FACEBOOK_IPA_URL }}
+        run: |
+          set -euo pipefail
+          [[ "${IPA_SOURCE_URL:-}" == https://* ]] || exit 1
+          mkdir -p test
+          curl --fail --location --silent --show-error --retry 2 --max-time 600 \
+            --output test/com.facebook.Facebook.ipa "$IPA_SOURCE_URL"
+          unzip -tqq test/com.facebook.Facebook.ipa
+          unzip -Z1 test/com.facebook.Facebook.ipa | grep -E '^Payload/[^/]+\.app/Info\.plist$' >/dev/null
+      - name: Install Facebook Plus build dependencies
+        shell: bash
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -euo pipefail
+          brew install ldid dpkg xz
+          git clone --quiet --recursive https://github.com/theos/theos.git "$THEOS"
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+      - name: Build tweak and package IPA
+        shell: bash
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          SCHEMES: rootless
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: |
+          set -euo pipefail
+          ./build.sh
+          compgen -G 'packages/*.ipa' >/dev/null || { echo 'No IPA generated.' >&2; exit 1; }
+      - name: Save IPA as draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ipas=(packages/*.ipa)
+          (( ${#ipas[@]} == 1 )) || { echo 'Expected one IPA.' >&2; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json id >/dev/null 2>&1; then
+            draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            [[ "$draft" == true ]] || { echo 'Refusing upload to published release.' >&2; exit 1; }
+            gh release upload "$TAG" "${ipas[0]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "${ipas[0]}" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "Facebook Plus / upstream ${UPSTREAM_SHA:0:12}" \
+              --notes "Synced from SHAJON-404/Facebook-Plus at $UPSTREAM_SHA. Unsigned IPA for manual installation. Do not publish third-party app binaries."
+          fi
+          echo "IPA ready: https://github.com/$GITHUB_REPOSITORY/releases (draft)" >> "$GITHUB_STEP_SUMMARY"
